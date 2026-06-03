@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ambientes Virtuais
+.venv/
+venv/
+ENV/
+env/
+
+# Dados e Arquivos Temporários
+*.csv
+*.zip
+*.xlsx
+*.png
+*.html
+
+# Arquivos de Senhas e Segredos
+.env
+
+# Build e Distribuição
+build/
+dist/
+*.spec
