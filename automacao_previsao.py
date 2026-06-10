@@ -338,11 +338,25 @@ async def atualizar_planilha(page, dados, valores_originais):
     
     # Espera adicional para garantir que a planilha carregue completamente após o login
     await asyncio.sleep(5)
-            
+    
+    # Tentar recarregar a planilha se ainda não estiver visível
+    if "docs.google.com" in page.url:
+        print("Planilha carregando...")
+        try:
+            await page.reload(timeout=120000, wait_until="domcontentloaded")
+        except:
+            pass
+        await asyncio.sleep(5)
+    
     # Esperar planilha carregar
     try:
-        await page.wait_for_selector(".docs-sheet-tab-name", timeout=60000)
+        await page.wait_for_selector(".docs-sheet-tab-name", timeout=120000)
     except:
+        try:
+            await page.screenshot(path="erro_planilha.png")
+            print(f"Print salvo em erro_planilha.png. URL atual: {page.url[:200]}")
+        except:
+            pass
         print("Planilha não carregou a tempo.")
         return False
         
@@ -374,8 +388,18 @@ async def atualizar_planilha(page, dados, valores_originais):
             aba_hoje_existe = True
     
     if aba_origem_tab is None:
-        print(f"Aba '{aba_ontem}' não encontrada!")
-        return False
+        print(f"Aba '{aba_ontem}' não encontrada! Buscando aba mais recente...")
+        for tab in tabs:
+            nome = await tab.inner_text()
+            nome = nome.strip()
+            if nome != aba_hoje and not nome.startswith("Cópia") and not nome.startswith("Copy"):
+                aba_origem_tab = tab
+                aba_ontem = nome
+                print(f"Usando aba '{nome}' como origem.")
+                break
+        if aba_origem_tab is None:
+            print("Nenhuma aba disponível encontrada.")
+            return False
     
     print(f"Aba origem encontrada: '{aba_ontem}'")
     
