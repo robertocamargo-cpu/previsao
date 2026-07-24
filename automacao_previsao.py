@@ -4,6 +4,9 @@ import re
 import csv
 import io
 import zipfile
+import json
+import urllib.request
+import argparse
 from datetime import datetime, timedelta
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -12,8 +15,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── Configurações ─────────────────────────────────────────────────────────
-BASE_DIR = r"c:\Users\finan\OneDrive\Área de Trabalho\Previsao"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PLANILHA_URL = "https://docs.google.com/spreadsheets/d/1OHMAcfxKIS2UTntlB5J7Y8krmCK7JHT9miEHmbbmLE8/edit#gid=993064263"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # ERP
 ERP_URL = "https://erp.admsis.com/Home"
@@ -26,10 +30,26 @@ GOOGLE_PASS = os.getenv("GOOGLE_PASS")
 
 # Filiais a pesquisar
 FILIAIS = ["302", "429", "551", "601", "Nevine"]
+MAP_FILIAIS = {
+    "302": 16,
+    "429": 17,
+    "551": 18,
+    "601": 19,
+    "Nevine": 20
+}
+MAP_F3_F7 = {
+    "302": 3,
+    "429": 4,
+    "551": 5,
+    "601": 6,
+    "Nevine": 7
+}
 
-FERIADOS = [
+FERIADOS_PADRAO = [
     (1, 1),   # Confraternização Universal
+    (21, 4),  # Tiradentes
     (1, 5),   # Dia do Trabalho
+    (9, 7),   # Revolução Constitucionalista
     (7, 9),   # Independência do Brasil
     (12, 10), # Nossa Senhora Aparecida
     (2, 11),  # Finados
@@ -38,10 +58,42 @@ FERIADOS = [
     (25, 12)  # Natal
 ]
 
+def carregar_feriados():
+    recorrentes = set(FERIADOS_PADRAO)
+    especificos = set()
+    path = os.path.join(BASE_DIR, "feriados.md")
+    if not os.path.exists(path):
+        print("feriados.md não encontrado; usando feriados padrão do código.")
+        return recorrentes, especificos
+
+    padrao_recorrente = re.compile(r"\b(\d{2})/(\d{2})\b")
+    padrao_especifico = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                m_especifico = padrao_especifico.search(line)
+                if m_especifico:
+                    ano, mes, dia = map(int, m_especifico.groups())
+                    especificos.add(datetime(ano, mes, dia).date())
+                    continue
+
+                m_recorrente = padrao_recorrente.search(line)
+                if m_recorrente:
+                    dia, mes = map(int, m_recorrente.groups())
+                    recorrentes.add((dia, mes))
+    except Exception as e:
+        print(f"Erro ao ler feriados.md; usando feriados padrão do código: {e}")
+    return recorrentes, especificos
+
+FERIADOS_RECORRENTES, FERIADOS_ESPECIFICOS = carregar_feriados()
+
 def is_dia_util(d):
     if d.weekday() >= 5:
         return False
-    if (d.day, d.month) in FERIADOS:
+    data = d.date() if hasattr(d, "date") else d
+    if data in FERIADOS_ESPECIFICOS:
+        return False
+    if (d.day, d.month) in FERIADOS_RECORRENTES:
         return False
     return True
 
@@ -51,8 +103,134 @@ def dia_util_anterior(d):
         d -= timedelta(days=1)
     return d
 
-def calcular_datas():
-    hoje = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+def proximo_dia_util(d):
+    while not is_dia_util(d):
+        d += timedelta(days=1)
+    return d
+
+def parse_data_aba(nome):
+    partes = nome[:10].strip().split(" ")
+    if len(partes) != 3:
+        return None
+    try:
+        return datetime(int(partes[2]), int(partes[1]), int(partes[0]))
+    except:
+        return None
+
+def selecionar_aba_origem(tab_names, hoje):
+    melhor_nome = None
+    melhor_tab = None
+    melhor_data = None
+    for nome, tab in tab_names:
+        dt = parse_data_aba(nome)
+        if dt and dt < hoje and (melhor_data is None or dt > melhor_data):
+            melhor_nome = nome
+            melhor_tab = tab
+            melhor_data = dt
+    return melhor_nome, melhor_tab
+
+async def mover_aba_ativa_para_inicio(page):
+    try:
+        tabs = page.locator('.docs-sheet-tab')
+        if await tabs.count() <= 1:
+            return
+
+        active_name = (await page.locator('.docs-sheet-active-tab .docs-sheet-tab-name').first.inner_text()).strip()
+        active_tab = page.locator('.docs-sheet-active-tab').first
+        first_tab = tabs.first
+        active_box = await active_tab.bounding_box()
+        first_box = await first_tab.bounding_box()
+        if not active_box or not first_box:
+            print("Não foi possível calcular a posição das abas para mover ao início.")
+            return
+        if active_box["x"] <= first_box["x"] + 2:
+            print("Aba nova já está na primeira posição.")
+            return
+
+        print("Movendo aba nova para a primeira posição...")
+        await page.mouse.move(
+            active_box["x"] + active_box["width"] / 2,
+            active_box["y"] + active_box["height"] / 2,
+        )
+        await page.mouse.down()
+        await page.mouse.move(
+            max(first_box["x"] + 2, 2),
+            first_box["y"] + first_box["height"] / 2,
+            steps=25,
+        )
+        await page.mouse.up()
+        await asyncio.sleep(2)
+
+        tab_names = [nome.strip() for nome in await page.locator(".docs-sheet-tab-name").all_inner_texts()]
+        if tab_names and tab_names[0] == active_name:
+            print("Aba nova movida para a primeira posição.")
+            return
+
+        try:
+            idx = tab_names.index(active_name)
+        except ValueError:
+            print("Não foi possível localizar a aba ativa após o arraste.")
+            return
+
+        print(f"Arraste não colocou a aba no início; movendo {idx} posição(ões) para a esquerda pelo menu...")
+        for i in range(idx):
+            if i and i % 25 == 0:
+                print(f"  Movimentos feitos: {i}/{idx}")
+            await clicar_opcao_menu_aba_ativa(page, ["Mover para a esquerda", "Move left"])
+
+        tab_names = [nome.strip() for nome in await page.locator(".docs-sheet-tab-name").all_inner_texts()]
+        if tab_names and tab_names[0] == active_name:
+            print("Aba nova está na primeira posição.")
+        else:
+            print("Aba nova não ficou na primeira posição após a movimentação automática.")
+    except Exception as e:
+        print(f"Não foi possível mover a aba para o início automaticamente: {e}")
+
+async def clicar_opcao_menu_aba_ativa(page, textos):
+    seletores = []
+    for texto in textos:
+        seletores.extend([
+            f'.goog-menuitem:has-text("{texto}"):visible',
+            f'.goog-menuitem-content:has-text("{texto}"):visible',
+        ])
+
+    async def tentar_clicar_opcao(timeout=3000):
+        for seletor in seletores:
+            opcao = page.locator(seletor).first
+            try:
+                await opcao.wait_for(state="visible", timeout=timeout)
+                await opcao.click()
+                return True
+            except:
+                pass
+        return False
+
+    await page.keyboard.press("Escape")
+    await asyncio.sleep(0.3)
+    active_tab = page.locator('.docs-sheet-active-tab').first
+    await active_tab.hover()
+    seta = page.locator('.docs-sheet-active-tab .docs-sheet-tab-dropdown').first
+    try:
+        await seta.wait_for(state="visible", timeout=5000)
+        await seta.click(force=True)
+    except:
+        await page.locator('.docs-sheet-active-tab .docs-sheet-tab-name').first.click(button='right')
+    await asyncio.sleep(1)
+
+    if await tentar_clicar_opcao():
+        return True
+
+    await page.keyboard.press("Escape")
+    await asyncio.sleep(0.3)
+    await page.locator('.docs-sheet-active-tab .docs-sheet-tab-name').first.click(button='right')
+    await asyncio.sleep(1)
+    if await tentar_clicar_opcao():
+        return True
+
+    raise RuntimeError(f"Opção do menu da aba não encontrada: {', '.join(textos)}")
+
+def calcular_datas(data_base=None):
+    hoje = (data_base or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
     data_inicio = hoje - timedelta(days=2)
     data_fim = hoje + timedelta(days=10)
     
@@ -172,12 +350,179 @@ def format_brl(val):
     """Formata número para padrão brasileiro: 1.234,56"""
     return f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+def normalizar_filial_dict(valores):
+    normalizado = {}
+    for filial, valor in valores.items():
+        filial_str = str(int(float(filial))) if isinstance(filial, (int, float)) else str(filial)
+        normalizado[filial_str] = valor
+    return normalizado
+
+def calcular_dias_alvo(dt_nova, quantidade=3):
+    dias = []
+    curr = dt_nova + timedelta(days=1)
+    while len(dias) < quantidade:
+        if is_dia_util(curr):
+            dias.append(curr)
+        curr += timedelta(days=1)
+    return dias
+
+def ler_csv_zip(path):
+    df_list = []
+    with zipfile.ZipFile(path, 'r') as z:
+        for filename in z.namelist():
+            if filename.endswith('.csv'):
+                with z.open(filename) as f:
+                    df_part = pd.read_csv(f, sep=';', encoding='latin-1', on_bad_lines='skip')
+                    df_list.append(df_part)
+    if not df_list:
+        return pd.DataFrame()
+    return pd.concat(df_list, ignore_index=True)
+
+def somar_zip_por_data(path, date_col, value_col, filial_col, saldo_col, data_obj):
+    try:
+        df = ler_csv_zip(path)
+        if df.empty:
+            return {}
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df[value_col] = df[value_col].apply(clean_currency).fillna(0)
+        df[saldo_col] = df[saldo_col].apply(clean_currency).fillna(0)
+        df = df[df[saldo_col] > 0]
+        mask = df[date_col] == pd.Timestamp(data_obj)
+        valores = df[mask].groupby(filial_col)[value_col].sum().to_dict()
+        return normalizar_filial_dict(valores)
+    except Exception as e:
+        print(f"Erro ao somar {path} em {data_obj.strftime('%d/%m/%Y')}: {e}")
+        return {}
+
+def somar_zip_por_data_ajustada(path, date_col, value_col, filial_col, saldo_col, data_obj, ajuste_fn):
+    try:
+        df = ler_csv_zip(path)
+        if df.empty:
+            return {}
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df[value_col] = df[value_col].apply(clean_currency).fillna(0)
+        df[saldo_col] = df[saldo_col].apply(clean_currency).fillna(0)
+        df = df[df[saldo_col] > 0].copy()
+        df[date_col] = df[date_col].apply(ajuste_fn)
+        mask = df[date_col] == pd.Timestamp(data_obj)
+        valores = df[mask].groupby(filial_col)[value_col].sum().to_dict()
+        return normalizar_filial_dict(valores)
+    except Exception as e:
+        print(f"Erro ao somar {path} com ajuste em {data_obj.strftime('%d/%m/%Y')}: {e}")
+        return {}
+
+def valor_filial(valores, filial):
+    return valores.get(filial, 0)
+
+def montar_atualizacoes_planilha(dt_nova, dados):
+    dias_alvo = calcular_dias_alvo(dt_nova)
+    file_pagar = os.path.join(BASE_DIR, "titulos a pagar.zip")
+    file_receber = os.path.join(BASE_DIR, "titulos a receber.zip")
+
+    dia_seguinte_b15 = dias_alvo[0].strftime("%d/%m")
+    dia_seguinte_f15 = dias_alvo[1].strftime("%d/%m")
+    dia_seguinte_j15 = dias_alvo[2].strftime("%d/%m")
+
+    atualizacoes = [
+        ("E1", dt_nova.strftime("%d/%m/%Y")),
+        ("B15", dt_nova.strftime("%d/%m")),
+        ("C15", dia_seguinte_b15),
+        ("D15", f"{dt_nova.strftime('%d/%m')} a {dias_alvo[0].strftime('%d/%m')}"),
+        ("F15", dias_alvo[0].strftime("%d/%m")),
+        ("G15", dia_seguinte_f15),
+        ("H15", f"{dias_alvo[0].strftime('%d/%m')} a {dias_alvo[1].strftime('%d/%m')}"),
+        ("J15", dias_alvo[1].strftime("%d/%m")),
+        ("K15", dia_seguinte_j15),
+        ("L15", f"{dias_alvo[1].strftime('%d/%m')} a {dias_alvo[2].strftime('%d/%m')}"),
+        ("C13", dia_seguinte_b15),
+        ("F13", dias_alvo[0].strftime("%d/%m")),
+        ("G13", dia_seguinte_f15),
+        ("J13", dias_alvo[1].strftime("%d/%m")),
+        ("K13", dia_seguinte_j15),
+    ]
+
+    valores_f = somar_zip_por_data_ajustada(file_receber, 'ttr_data_vencimento', 'ttr_valor_titulo', 'fil_descricao', 'ttr_saldo', dias_alvo[0], ajustar_data_receber)
+    valores_g = somar_zip_por_data(file_pagar, 'ttp_data_vencimento', 'ttp_valor_titulo', 'fil_descricao', 'ttp_saldo', dias_alvo[1])
+    valores_j = somar_zip_por_data_ajustada(file_receber, 'ttr_data_vencimento', 'ttr_valor_titulo', 'fil_descricao', 'ttr_saldo', dias_alvo[1], ajustar_data_receber)
+    valores_k = somar_zip_por_data(file_pagar, 'ttp_data_vencimento', 'ttp_valor_titulo', 'fil_descricao', 'ttp_saldo', dias_alvo[2])
+    valores_c = somar_zip_por_data(file_pagar, 'ttp_data_vencimento', 'ttp_valor_titulo', 'fil_descricao', 'ttp_saldo', dias_alvo[0])
+    valores_m = somar_zip_por_data_ajustada(file_receber, 'ttr_data_vencimento', 'ttr_valor_titulo', 'fil_descricao', 'ttr_saldo', dt_nova, ajustar_data_receber)
+
+    for filial, linha in MAP_FILIAIS.items():
+        atualizacoes.extend([
+            (f"F{linha}", valor_filial(valores_f, filial)),
+            (f"G{linha}", valor_filial(valores_g, filial)),
+            (f"J{linha}", valor_filial(valores_j, filial)),
+            (f"K{linha}", valor_filial(valores_k, filial)),
+            (f"C{linha}", valor_filial(valores_c, filial)),
+            (f"M{linha}", valor_filial(valores_m, filial)),
+        ])
+
+    valores_pagar_hoje = dados.get(dt_nova.strftime("%d/%m/%Y"), {}).get('pagar', {})
+    for filial, linha in MAP_F3_F7.items():
+        atualizacoes.append((f"F{linha}", valor_filial(valores_pagar_hoje, filial)))
+
+    return atualizacoes, dias_alvo
+
+def formatar_valor_celula(valor):
+    if isinstance(valor, (int, float)):
+        return str(round(valor, 2)).replace('.', ',')
+    return str(valor)
+
+async def preencher_celula(page, celula, valor, delay=0.5):
+    await page.keyboard.press("F5")
+    await asyncio.sleep(delay)
+    await page.keyboard.type(celula)
+    await page.keyboard.press("Enter")
+    await asyncio.sleep(delay)
+    await page.keyboard.type(formatar_valor_celula(valor))
+    await page.keyboard.press("Enter")
+    await asyncio.sleep(delay)
+
+async def preencher_celulas(page, atualizacoes):
+    for celula, valor in atualizacoes:
+        await preencher_celula(page, celula, valor)
+        print(f"    {celula}: {formatar_valor_celula(valor)}")
+
+def imprimir_dry_run(dt_nova, atualizacoes, dias_alvo):
+    print("\nDRY-RUN: nenhuma alteração será feita na planilha.")
+    print(f"Data da previsão: {dt_nova.strftime('%d/%m/%Y')}")
+    print("Dias alvo:", ", ".join(d.strftime("%d/%m/%Y") for d in dias_alvo))
+    print(f"Células calculadas: {len(atualizacoes)}")
+    for celula, valor in atualizacoes:
+        print(f"  {celula} = {formatar_valor_celula(valor)}")
+
+def validar_mapa_atualizacoes(atualizacoes):
+    obrigatorias = {"E1", "C13", "G13", "K13", "B15", "C15", "G15", "K15", "F16", "C16", "M16", "F3"}
+    vistos = {}
+    duplicadas = []
+    vazias = []
+    for celula, valor in atualizacoes:
+        if celula in vistos:
+            duplicadas.append(celula)
+        vistos[celula] = valor
+        if valor is None or valor == "":
+            vazias.append(celula)
+
+    faltantes = sorted(obrigatorias - set(vistos))
+    if duplicadas or faltantes or vazias:
+        partes = []
+        if faltantes:
+            partes.append(f"faltantes: {', '.join(faltantes)}")
+        if duplicadas:
+            partes.append(f"duplicadas: {', '.join(sorted(set(duplicadas)))}")
+        if vazias:
+            partes.append(f"vazias: {', '.join(vazias)}")
+        raise ValueError("Mapa de preenchimento inválido (" + "; ".join(partes) + ")")
+
+    print(f"Validação local OK: {len(atualizacoes)} células, sem duplicidades críticas.")
+
 def ajustar_data_receber(d):
-    """Finais de semana/Feriados → dia útil anterior."""
+    """Finais de semana/Feriados → próximo dia útil."""
     if pd.isna(d):
         return d
     if not is_dia_util(d):
-        return dia_util_anterior(d)
+        return proximo_dia_util(d)
     return d
 
 def ajustar_data_pagar(d):
@@ -292,7 +637,7 @@ def processar_csvs(d_inicio, d_fim):
     print("Processamento concluído.")
     return dados_organizados, valores_originais
 
-async def atualizar_planilha(page, dados, valores_originais):
+async def atualizar_planilha(page, dados, valores_originais, data_base=None):
     print("\nAtualizando Google Sheets...")
     
     # 1. Abrir planilha
@@ -306,8 +651,8 @@ async def atualizar_planilha(page, dados, valores_originais):
     if "accounts.google.com" in page.url:
         print("Login do Google detectado. Inserindo credenciais...")
         try:
-            # Tela de email: usar apenas o campo visível (ignora hiddenEmail com aria-hidden)
-            email_selector = 'input[type="email"]:not([aria-hidden="true"])'
+            # Tela de email: usar apenas o campo visível
+            email_selector = '#identifierId'
             email_field = page.locator(email_selector).first
             try:
                 await email_field.wait_for(state="visible", timeout=10000)
@@ -319,7 +664,7 @@ async def atualizar_planilha(page, dados, valores_originais):
                 print(f"Campo de email não visível (pode já estar na tela de senha): {e_email}")
 
             # Tela de senha
-            password_field = page.locator('input[type="password"]').first
+            password_field = page.locator('input[name="Passwd"]').first
             await password_field.wait_for(state="visible", timeout=20000)
             await password_field.fill(GOOGLE_PASS)
             await page.click('#passwordNext')
@@ -362,613 +707,177 @@ async def atualizar_planilha(page, dados, valores_originais):
         
     await asyncio.sleep(5)
     
-    # 2. Calcular hoje e ontem
-    hoje = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    ontem = hoje - timedelta(days=1)
-    while not is_dia_util(ontem):
-        ontem -= timedelta(days=1)
+    # 2. Calcular hoje e selecionar a aba de origem mais recente antes de hoje.
+    # Mesmo quando ontem foi feriado, se a aba existir ela deve ser usada como base visual.
+    hoje = (data_base or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
     aba_hoje = hoje.strftime("%d %m %Y")
-    aba_ontem = ontem.strftime("%d %m %Y")
     
-    print(f"Procurando aba '{aba_ontem}' para duplicar e renomear para: '{aba_hoje}'")
+    print(f"Procurando a aba mais recente antes de '{aba_hoje}' para duplicar.")
     
     # 3. Encontrar todas as abas
     tabs = await page.query_selector_all(".docs-sheet-tab-name")
     
     aba_origem_tab = None
     aba_hoje_existe = False
+    tab_names = []
     
     for tab in tabs:
         nome = await tab.inner_text()
         nome = nome.strip()
         print(f"  Aba encontrada: '{nome}'")
-        if nome == aba_ontem:
-            aba_origem_tab = tab
-        if nome == aba_hoje:
+        tab_names.append((nome, tab))
+        if nome == aba_hoje or nome.startswith(aba_hoje):
             aba_hoje_existe = True
     
+    aba_origem, aba_origem_tab = selecionar_aba_origem(tab_names, hoje)
     if aba_origem_tab is None:
-        print(f"Aba '{aba_ontem}' não encontrada! Buscando aba mais recente...")
-        for tab in tabs:
-            nome = await tab.inner_text()
-            nome = nome.strip()
-            if nome != aba_hoje and not nome.startswith("Cópia") and not nome.startswith("Copy"):
-                aba_origem_tab = tab
-                aba_ontem = nome
-                print(f"Usando aba '{nome}' como origem.")
-                break
-        if aba_origem_tab is None:
-            print("Nenhuma aba disponível encontrada.")
-            return False
+        print("Nenhuma aba anterior disponível encontrada.")
+        return False
     
-    print(f"Aba origem encontrada: '{aba_ontem}'")
+    print(f"Aba origem encontrada: '{aba_origem}'")
     
-    # 4. Verificar se a aba de hoje já existe
+    # 4. Verificar se a aba de hoje já existe — se sim, excluir para recriar do zero
     if aba_hoje_existe:
-        print(f"Aba de hoje '{aba_hoje}' já existe. Ativando para preenchimento.")
+        print(f"Aba '{aba_hoje}' já existe. Excluindo para recriar corretamente...")
+        for tab in tab_names:
+            nome, t = tab
+            if nome == aba_hoje or nome.startswith(aba_hoje):
+                await t.click()
+                await asyncio.sleep(1)
+                await clicar_opcao_menu_aba_ativa(page, ["Excluir", "Delete"])
+                await asyncio.sleep(1)
+                # Confirmar se aparecer um diálogo
+                try:
+                    ok_btn = page.locator('button:has-text("OK"), button:has-text("Excluir"), button:has-text("Delete")').first
+                    if await ok_btn.is_visible(timeout=3000):
+                        await ok_btn.click()
+                        await asyncio.sleep(1)
+                except:
+                    pass
+                print(f"Aba '{nome}' excluída.")
+                break
+        aba_hoje_existe = False  # forçar recriação abaixo
+        await asyncio.sleep(2)
+        tabs = await page.query_selector_all(".docs-sheet-tab-name")
+        tab_names = []
         for tab in tabs:
             nome = await tab.inner_text()
-            if nome.strip() == aba_hoje:
-                await tab.click()
-                await asyncio.sleep(2)
-                break
-    else:
-        # 6. Ativar a aba origem e duplicar
-        print(f"Ativando aba '{aba_ontem}'...")
-        await aba_origem_tab.click()
-        await asyncio.sleep(2)
-        print(f"Duplicando aba '{aba_ontem}'...")
-        seta = page.locator('.docs-sheet-active-tab .docs-sheet-tab-dropdown')
-        await seta.click()
+            tab_names.append((nome.strip(), tab))
+        aba_origem, aba_origem_tab = selecionar_aba_origem(tab_names, hoje)
+        if aba_origem_tab is None:
+            print("Aba origem não encontrada após excluir a aba de hoje.")
+            return False
+
+    # 6. Ativar a aba origem e duplicar
+    print(f"Ativando aba '{aba_origem}'...")
+    await aba_origem_tab.click()
+    await asyncio.sleep(2)
+    print(f"Duplicando aba '{aba_origem}'...")
+    await clicar_opcao_menu_aba_ativa(page, ["Duplicar", "Duplicate"])
+    print("Aba duplicada. Aguardando processamento do Google Sheets...")
+    await asyncio.sleep(8)
+    
+    # Tentar fechar modal se existir (Forçando remoção via JS)
+    try:
+        await page.evaluate('''
+            document.querySelectorAll(".modal-dialog-bg, .modal-dialog").forEach(el => el.remove());
+        ''')
         await asyncio.sleep(1)
-        
-        duplicar_btn = page.locator('.goog-menuitem:has-text("Duplicar"):visible, .goog-menuitem:has-text("Duplicate"):visible').first
-        await duplicar_btn.click()
-        print("Aba duplicada. Aguardando processamento do Google Sheets...")
-        await asyncio.sleep(8)
-        
-        # Esperar modal fechar se existir
-        try:
-            await page.wait_for_selector('.modal-dialog-bg', state='hidden', timeout=10000)
-        except:
-            pass
-        
-        await asyncio.sleep(2)
-        
-        # 7. Renomear a aba duplicada para hoje
-        print(f"Renomeando aba para '{aba_hoje}'...")
-        # Ensure the tab name element is ready
-        await page.wait_for_selector('.docs-sheet-active-tab .docs-sheet-tab-name', state='visible', timeout=15000)
-        nova_aba_tab = page.locator('.docs-sheet-active-tab .docs-sheet-tab-name')
-        try:
-            await nova_aba_tab.dblclick()
-        except Exception:
-            # fallback: right-click then choose rename
-            await nova_aba_tab.click(button='right')
-            await asyncio.sleep(0.5)
-            renomear_opt = page.locator('.goog-menuitem:has-text("Renomear"), .goog-menuitem:has-text("Rename")').first
-            await renomear_opt.click()
-            await asyncio.sleep(0.5)
-        # Clear existing name and type new name
-        await page.keyboard.press("Control+A")
-        await page.keyboard.type(aba_hoje)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(3)
-        
-        print(f"Aba renomeada para '{aba_hoje}'.")
+    except:
+        pass
+    
+    await asyncio.sleep(2)
+    
+    # 7. Renomear a aba duplicada para hoje
+    print(f"Renomeando aba para '{aba_hoje}'...")
+    # Ensure the tab name element is ready
+    await page.wait_for_selector('.docs-sheet-active-tab .docs-sheet-tab-name', state='visible', timeout=15000)
+    nova_aba_tab = page.locator('.docs-sheet-active-tab .docs-sheet-tab-name')
+    try:
+        await nova_aba_tab.dblclick()
+    except Exception:
+        # fallback: right-click then choose rename
+        await nova_aba_tab.click(button='right')
+        await asyncio.sleep(0.5)
+        renomear_opt = page.locator('.goog-menuitem:has-text("Renomear"), .goog-menuitem:has-text("Rename")').first
+        await renomear_opt.click()
+        await asyncio.sleep(0.5)
+    # Clear existing name and type new name. Google Sheets on macOS needs Meta+A.
+    await page.keyboard.press("Control+A")
+    await page.keyboard.press("Meta+A")
+    await page.keyboard.press("Backspace")
+    await page.keyboard.type(aba_hoje)
+    await page.keyboard.press("Enter")
+    await asyncio.sleep(3)
+    
+    print(f"Aba renomeada para '{aba_hoje}'.")
+    await mover_aba_ativa_para_inicio(page)
     
     dt_nova = hoje
     
     # 8. Preencher Cabeçalhos e Dados (Apenas os 3 próximos dias úteis)
     print(f"Iniciando preenchimento dos dados para a data {aba_hoje} via interface (Atalho F5)...")
-    
-    # Calcular os 3 próximos dias úteis baseados na data de hoje
-    dias_alvo = []
-    curr = dt_nova + timedelta(days=1)
-    while len(dias_alvo) < 3:
-        if is_dia_util(curr):
-            dias_alvo.append(curr)
-        curr += timedelta(days=1)
-        
-    map_filiais = {
-        "302": 16,
-        "429": 17,
-        "551": 18,
-        "601": 19,
-        "Nevine": 20
-    }
-    
-    colunas_por_dia = [
-        {"header": "F13", "receber": None, "pagar": "C"},
-        {"header": "J13", "receber": None, "pagar": "G"},
-        {"header": "K13", "receber": None, "pagar": "K"}
-    ]
-    
-    # Calcular datas do dia seguinte para C15, G15, K15
-    # C15 = dia seguinte ao B15, G15 = dia seguinte ao F15, K15 = dia seguinte ao J15
-    dia_seguinte_b15 = dias_alvo[0].strftime("%d/%m")  # próxima data útil após dt_nova
-    dia_seguinte_f15 = dias_alvo[1].strftime("%d/%m")  # próxima data útil após dias_alvo[0]
-    dia_seguinte_j15 = dias_alvo[2].strftime("%d/%m")  # próxima data útil após dias_alvo[1]
-    
-    # Atualizar a Linha 15 (rótulos de período baseados em dt_nova)
-    str_b15 = dt_nova.strftime("%d/%m")
-    str_d15 = f"{dt_nova.strftime('%d/%m')} a {dias_alvo[0].strftime('%d/%m')}"
-    str_f15 = dias_alvo[0].strftime("%d/%m")
-    str_h15 = f"{dias_alvo[0].strftime('%d/%m')} a {dias_alvo[1].strftime('%d/%m')}"
-    str_j15 = dias_alvo[1].strftime("%d/%m")
-    str_l15 = f"{dias_alvo[1].strftime('%d/%m')} a {dias_alvo[2].strftime('%d/%m')}"
-    
-    atualizacoes_row15 = [
-        ("B15", str_b15), ("C15", dia_seguinte_b15), ("D15", str_d15),
-        ("F15", str_f15), ("G15", dia_seguinte_f15), ("H15", str_h15),
-        ("J15", str_j15), ("K15", dia_seguinte_j15), ("L15", str_l15)
-    ]
-    
-    for celula, valor in atualizacoes_row15:
-        await page.keyboard.press("F5")
-        await asyncio.sleep(0.5)
-        await page.keyboard.type(celula)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        await page.keyboard.type(valor)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-    
-    # As datas para extrair os valores (correspondentes à linha 15: B15, F15, J15)
-    # B = dias_alvo[0], F = dias_alvo[1], J = dias_alvo[2] (dias úteis seguintes)
-    datas_para_receber = [dias_alvo[0], dias_alvo[1], dias_alvo[2]]
-    
-    for i in range(len(colunas_por_dia)):
-        data_obj_header = dias_alvo[i]
-        data_obj_dados = datas_para_receber[i]
-        
-        data_str_full_dados = data_obj_dados.strftime("%d/%m/%Y")
-        data_str_header = data_obj_header.strftime("%d/%m")
-        cols = colunas_por_dia[i]
-        data_str_full_pagar = data_obj_header.strftime("%d/%m/%Y")
-        
-        # Para colunas C, G, K (pagar), usar o dia atual (não o seguinte)
-        # C = Pagar 12/05, G = Pagar 13/05, K = Pagar 15/05
-        data_str_pagar_seguinte = data_obj_header.strftime("%d/%m/%Y")
-        
-        print(f"  -> Dia {i+1}: {data_str_header} | Rec: {data_str_full_dados} | Pagar: {data_str_pagar_seguinte}")
-        
-        # 1. Atualizar o cabeçalho (ex: B13)
-        await page.keyboard.press("F5")
-        await asyncio.sleep(0.5)
-        await page.keyboard.type(cols["header"])
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        await page.keyboard.type(data_str_header)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        
-        # 2. Preencher Recebíveis e Pagamentos das filiais
-        # Calcular data do dia seguinte para colunas C, G, K (pagamos no dia seguinte ao recebimento)
-        # Para i=0, buscar pagar de 13/05; para i=1, buscar pagar de 14/05; para i=2, buscar pagar de 15/05
-        if i < 2:
-            data_str_pagar_seguinte = dias_alvo[i + 1].strftime("%d/%m/%Y")
-        else:
-            # Para o último dia, usar o próximo dia útil
-            next_day = dias_alvo[i] + timedelta(days=1)
-            while not is_dia_util(next_day):
-                next_day += timedelta(days=1)
-            data_str_pagar_seguinte = next_day.strftime("%d/%m/%Y")
-        
-        for filial, linha in map_filiais.items():
-            val_receber = dados.get(data_str_full_dados, {}).get('receber', {}).get(filial, 0)
-            val_pagar = dados.get(data_str_full_pagar, {}).get('pagar', {}).get(filial, 0)
-            val_pagar_seguinte = dados.get(data_str_pagar_seguinte, {}).get('pagar', {}).get(filial, 0)
-            
-            col_pagar = cols['pagar']
-            print(f"    {filial}: {cols['receber']}{linha}={val_receber}, {col_pagar}{linha}={val_pagar}")
-            
-            # PreencherReceber (F) - apenas se não for None
-            if cols['receber'] is not None:
-                celula_rec = f"{cols['receber']}{linha}"
-                await page.keyboard.press("F5")
-                await asyncio.sleep(1)
-                await page.keyboard.type(celula_rec)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(1)
-                if val_receber > 0:
-                    await page.keyboard.type(str(val_receber).replace('.', ','))
-                else:
-                    await page.keyboard.type("0")
-                await page.keyboard.press("Enter")
-            
-            # Pular preenchimento de pagar para G, K (serão preenchidos separadamente depois)
-            if cols['pagar'] in ["G", "K"]:
-                continue
-                
-            celula_pag = f"{col_pagar}{linha}"
-            await page.keyboard.press("F5")
-            await asyncio.sleep(1)
-            await page.keyboard.type(celula_pag)
-            await page.keyboard.press("Enter")
-            await asyncio.sleep(1)
-            if val_pagar > 0:
-                await page.keyboard.type(str(val_pagar).replace('.', ','))
-            else:
-                await page.keyboard.type("0")
-            await page.keyboard.press("Enter")
-                
-    
-        # -----------------------
-        # Preencher colunas Receber (F, J) usando dados agregados
-        # -----------------------
-        receber_cols = ["F", "J"]
-        for idx, col in enumerate(receber_cols):
-            # data correspondente ao dia de recebimento
-            data_str = dias_alvo[idx].strftime("%d/%m/%Y")
-            for filial, linha in map_filiais.items():
-                val = dados.get(data_str, {}).get('receber', {}).get(filial, 0)
-                celula = f"{col}{linha}"
-                await page.keyboard.press("F5")
-                await asyncio.sleep(1)
-                await page.keyboard.type(celula)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(1)
-                if val > 0:
-                    await page.keyboard.type(str(val).replace('.', ','))
-                else:
-                    await page.keyboard.type("0")
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.5)
-                print(f"    {filial} {col}{linha}: {val:.2f}")
-
-        # -----------------------
-        # Preencher colunas Pagar (C, G, K) usando dados agregados
-        # -----------------------
-        pagar_cols = ["C", "G", "K"]
-        for idx, col in enumerate(pagar_cols):
-            # data correspondente ao pagamento (já ajustada nas funções de ajuste)
-            data_str = dias_alvo[idx].strftime("%d/%m/%Y")
-            for filial, linha in map_filiais.items():
-                val = dados.get(data_str, {}).get('pagar', {}).get(filial, 0)
-                celula = f"{col}{linha}"
-                await page.keyboard.press("F5")
-                await asyncio.sleep(1)
-                await page.keyboard.type(celula)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(1)
-                if val > 0:
-                    await page.keyboard.type(str(val).replace('.', ','))
-                else:
-                    await page.keyboard.type("0")
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.5)
-                print(f"    {filial} {col}{linha}: {val:.2f}")
-
-
-
-        print("Preenchimento concluído.")
-    data_f = dias_alvo[0]  # Recebíveis para 13/05
-    print(f"  -> Preenchendo coluna F com Receber {data_f.strftime('%d/%m')} (sem ajuste)...")
-    
-    file_receber = os.path.join(BASE_DIR, "titulos a receber.zip")
-    
-    df_list_f = []
-    with zipfile.ZipFile(file_receber, 'r') as z:
-        for filename in z.namelist():
-            if filename.endswith('.csv'):
-                with z.open(filename) as f:
-                    df_part = pd.read_csv(f, sep=';', encoding='latin-1', on_bad_lines='skip')
-                    df_list_f.append(df_part)
-    df_f = pd.concat(df_list_f, ignore_index=True)
-    df_f['ttr_data_vencimento'] = pd.to_datetime(df_f['ttr_data_vencimento'], errors='coerce')
-    df_f['ttr_valor_titulo'] = df_f['ttr_valor_titulo'].apply(clean_currency).fillna(0)
-    df_f['ttr_saldo'] = df_f['ttr_saldo'].apply(clean_currency).fillna(0)
-    df_f = df_f[df_f['ttr_saldo'] > 0]
-    
-    mask_f = (df_f['ttr_data_vencimento'] == pd.Timestamp(data_f))
-    df_filtered_f = df_f[mask_f].copy()
-    valores_f = df_filtered_f.groupby('fil_descricao')['ttr_valor_titulo'].sum().to_dict()
-    
-    print(f"Valores para F ({data_f.strftime('%d/%m')} Receber): {valores_f}")
-    
-    for filial, linha in map_filiais.items():
-        filial_key = str(filial)
-        val_f = valores_f.get(filial_key, 0)
-        if val_f == 0:
-            try:
-                val_f = valores_f.get(float(filial_key), 0)
-            except:
-                val_f = 0
-        
-        celula_f = f"F{linha}"
-        await page.keyboard.press("F5")
-        await asyncio.sleep(1)
-        await page.keyboard.type(celula_f)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
-        if val_f > 0:
-            await page.keyboard.type(str(val_f).replace('.', ','))
-        else:
-            await page.keyboard.type("0")
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        print(f"    {filial} F{linha}: {val_f:.2f}")
-    
-    # Preencher coluna G com Pagar - direto do CSV
-    data_g = dias_alvo[1]  # Pagamento 14/05
-    print(f"  -> Preenchendo coluna G com Pagar {data_g.strftime('%d/%m')}...")
-    
-    file_pagar = os.path.join(BASE_DIR, "titulos a pagar.zip")
-    
-    df_list_g = []
-    with zipfile.ZipFile(file_pagar, 'r') as z:
-        for filename in z.namelist():
-            if filename.endswith('.csv'):
-                with z.open(filename) as f:
-                    df_part = pd.read_csv(f, sep=';', encoding='latin-1', on_bad_lines='skip')
-                    df_list_g.append(df_part)
-    df_g = pd.concat(df_list_g, ignore_index=True)
-    df_g['ttp_data_vencimento'] = pd.to_datetime(df_g['ttp_data_vencimento'], errors='coerce')
-    df_g['ttp_valor_titulo'] = df_g['ttp_valor_titulo'].apply(clean_currency).fillna(0)
-    df_g['ttp_saldo'] = df_g['ttp_saldo'].apply(clean_currency).fillna(0)
-    df_g = df_g[df_g['ttp_saldo'] > 0]
-    
-    mask_g = (df_g['ttp_data_vencimento'] == pd.Timestamp(data_g))
-    df_filtered_g = df_g[mask_g].copy()
-    valores_g = df_filtered_g.groupby('fil_descricao')['ttp_valor_titulo'].sum().to_dict()
-    
-    print(f"Valores para G ({data_g.strftime('%d/%m')} Pagar): {valores_g}")
-    
-    for filial, linha in map_filiais.items():
-        filial_key = str(filial)
-        val_g = valores_g.get(filial_key, 0)
-        if val_g == 0:
-            try:
-                val_g = valores_g.get(float(filial_key), 0)
-            except:
-                val_g = 0
-        
-        celula_g = f"G{linha}"
-        await page.keyboard.press("F5")
-        await asyncio.sleep(1)
-        await page.keyboard.type(celula_g)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
-        if val_g > 0:
-            await page.keyboard.type(str(val_g).replace('.', ','))
-        else:
-            await page.keyboard.type("0")
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        print(f"    {filial} G{linha}: {val_g:.2f}")
-    
-    # Preencher coluna J com Receber - sem ajuste de data (direto do CSV)
-    data_j = dias_alvo[1]
-    print(f"  -> Preenchendo coluna J com Receber {data_j.strftime('%d/%m')} (sem ajuste)...")
-    
-    file_receber = os.path.join(BASE_DIR, "titulos a receber.zip")
-    
-    df_list_j = []
-    with zipfile.ZipFile(file_receber, 'r') as z:
-        for filename in z.namelist():
-            if filename.endswith('.csv'):
-                with z.open(filename) as f:
-                    df_part = pd.read_csv(f, sep=';', encoding='latin-1', on_bad_lines='skip')
-                    df_list_j.append(df_part)
-    df_j = pd.concat(df_list_j, ignore_index=True)
-    df_j['ttr_data_vencimento'] = pd.to_datetime(df_j['ttr_data_vencimento'], errors='coerce')
-    df_j['ttr_valor_titulo'] = df_j['ttr_valor_titulo'].apply(clean_currency).fillna(0)
-    df_j['ttr_saldo'] = df_j['ttr_saldo'].apply(clean_currency).fillna(0)
-    df_j = df_j[df_j['ttr_saldo'] > 0]
-    
-    mask_j = (df_j['ttr_data_vencimento'] == pd.Timestamp(data_j))
-    df_filtered_j = df_j[mask_j].copy()
-    valores_j = df_filtered_j.groupby('fil_descricao')['ttr_valor_titulo'].sum().to_dict()
-    
-    print(f"Valores para J ({data_j.strftime('%d/%m')} Receber): {valores_j}")
-    
-    for filial, linha in map_filiais.items():
-        filial_key = str(filial)
-        val_j = valores_j.get(filial_key, 0)
-        if val_j == 0:
-            try:
-                val_j = valores_j.get(float(filial_key), 0)
-            except:
-                val_j = 0
-        
-        celula_j = f"J{linha}"
-        await page.keyboard.press("F5")
-        await asyncio.sleep(1)
-        await page.keyboard.type(celula_j)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
-        if val_j > 0:
-            await page.keyboard.type(str(val_j).replace('.', ','))
-        else:
-            await page.keyboard.type("0")
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        print(f"    {filial} J{linha}: {val_j:.2f}")
-                
-    # Preencher coluna K com Pagar - direto do CSV
-    data_k = dias_alvo[2]
-    print(f"  -> Preenchendo coluna K com Pagar {data_k.strftime('%d/%m')}...")
-    
-    file_pagar = os.path.join(BASE_DIR, "titulos a pagar.zip")
-    
-    df_list_k = []
-    with zipfile.ZipFile(file_pagar, 'r') as z:
-        for filename in z.namelist():
-            if filename.endswith('.csv'):
-                with z.open(filename) as f:
-                    df_part = pd.read_csv(f, sep=';', encoding='latin-1', on_bad_lines='skip')
-                    df_list_k.append(df_part)
-    df_k = pd.concat(df_list_k, ignore_index=True)
-    df_k['ttp_data_vencimento'] = pd.to_datetime(df_k['ttp_data_vencimento'], errors='coerce')
-    df_k['ttp_valor_titulo'] = df_k['ttp_valor_titulo'].apply(clean_currency).fillna(0)
-    df_k['ttp_saldo'] = df_k['ttp_saldo'].apply(clean_currency).fillna(0)
-    df_k = df_k[df_k['ttp_saldo'] > 0]
-    
-    # Soma de data_k
-    datas = [pd.Timestamp(data_k)]
-    df_k_filt = df_k[df_k['ttp_data_vencimento'].isin(datas)]
-    valores_k = df_k_filt.groupby('fil_descricao')['ttp_valor_titulo'].sum().to_dict()
-    
-    print(f"Valores para K ({data_k.strftime('%d/%m')} Pagar): {valores_k}")
-    
-    for filial, linha in map_filiais.items():
-        filial_key = str(filial)
-        val_k = valores_k.get(filial_key, 0)
-        if val_k == 0:
-            try:
-                val_k = valores_k.get(float(filial_key), 0)
-            except:
-                val_k = 0
-        
-        celula_k = f"K{linha}"
-        await page.keyboard.press("F5")
-        await asyncio.sleep(1)
-        await page.keyboard.type(celula_k)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
-        if val_k > 0:
-            await page.keyboard.type(str(val_k).replace('.', ','))
-        else:
-            await page.keyboard.type("0")
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        print(f"    {filial} K{linha}: {val_k:.2f}")
-    
-    # Preencher coluna C com Pagamento 13/05 (mesmo dia que recebíveis de F)
-    data_c = dias_alvo[0]
-    print(f"  -> Preenchendo coluna C com Pagamento {data_c.strftime('%d/%m')}...")
-    
-    file_pagar_c = os.path.join(BASE_DIR, "titulos a pagar.zip")
-    
-    df_list_c = []
-    with zipfile.ZipFile(file_pagar_c, 'r') as z:
-        for filename in z.namelist():
-            if filename.endswith('.csv'):
-                with z.open(filename) as f:
-                    df_part = pd.read_csv(f, sep=';', encoding='latin-1', on_bad_lines='skip')
-                    df_list_c.append(df_part)
-    df_c = pd.concat(df_list_c, ignore_index=True)
-    df_c['ttp_data_vencimento'] = pd.to_datetime(df_c['ttp_data_vencimento'], errors='coerce')
-    df_c['ttp_valor_titulo'] = df_c['ttp_valor_titulo'].apply(clean_currency).fillna(0)
-    df_c['ttp_saldo'] = df_c['ttp_saldo'].apply(clean_currency).fillna(0)
-    df_c = df_c[df_c['ttp_saldo'] > 0]
-    
-    mask_c = (df_c['ttp_data_vencimento'] == pd.Timestamp(data_c))
-    df_filtered_c = df_c[mask_c].copy()
-    valores_c = df_filtered_c.groupby('fil_descricao')['ttp_valor_titulo'].sum().to_dict()
-    
-    print(f"Valores para C ({data_c.strftime('%d/%m')} Pagar): {valores_c}")
-    
-    for filial, linha in map_filiais.items():
-        filial_key = str(filial)
-        val_c = valores_c.get(filial_key, 0)
-        if val_c == 0:
-            try:
-                val_c = valores_c.get(float(filial_key), 0)
-            except:
-                val_c = 0
-        
-        celula_c = f"C{linha}"
-        await page.keyboard.press("F5")
-        await asyncio.sleep(1)
-        await page.keyboard.type(celula_c)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
-        if val_c > 0:
-            await page.keyboard.type(str(val_c).replace('.', ','))
-        else:
-            await page.keyboard.type("0")
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        print(f"    {filial} C{linha}: {val_c:.2f}")
-    
-    # Preencher coluna M com Receber de hoje - direto do CSV
-    data_m = hoje
-    print(f"  -> Preenchendo coluna M com Receber {data_m.strftime('%d/%m')}...")
-    
-    file_receber = os.path.join(BASE_DIR, "titulos a receber.zip")
-    
-    df_list = []
-    with zipfile.ZipFile(file_receber, 'r') as z:
-        for filename in z.namelist():
-            if filename.endswith('.csv'):
-                with z.open(filename) as f:
-                    df_part = pd.read_csv(f, sep=';', encoding='latin-1', on_bad_lines='skip')
-                    df_list.append(df_part)
-    df = pd.concat(df_list, ignore_index=True)
-    df['ttr_data_vencimento'] = pd.to_datetime(df['ttr_data_vencimento'], errors='coerce')
-    df['ttr_valor_titulo'] = df['ttr_valor_titulo'].apply(clean_currency).fillna(0)
-    df['ttr_saldo'] = df['ttr_saldo'].apply(clean_currency).fillna(0)
-    df = df[df['ttr_saldo'] > 0]
-    
-    mask = (df['ttr_data_vencimento'] == pd.Timestamp(data_m))
-    df_filtered = df[mask].copy()
-    valores_m = df_filtered.groupby('fil_descricao')['ttr_valor_titulo'].sum().to_dict()
-    
-    print(f"Valores para M ({data_m.strftime('%d/%m')} Receber): {valores_m}")
-    
-    for filial, linha in map_filiais.items():
-        filial_key = str(filial)
-        val_m = valores_m.get(filial_key, 0)
-        if val_m == 0:
-            try:
-                val_m = valores_m.get(float(filial_key), 0)
-            except:
-                val_m = 0
-        
-        celula_m = f"M{linha}"
-        await page.keyboard.press("F5")
-        await asyncio.sleep(1)
-        await page.keyboard.type(celula_m)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
-        if val_m > 0:
-            await page.keyboard.type(str(val_m).replace('.', ','))
-        else:
-            await page.keyboard.type("0")
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        print(f"    {filial} M{linha}: {val_m:.2f}")
-    
-    # Preencher F3:F7 com Pagar do dia atual
-    dt_hoje_str = hoje.strftime("%d/%m/%Y")
-    print(f"  -> Preenchendo F3:F7 com Pagar {dt_hoje_str}...")
-    valores_pagar_hoje = dados.get(dt_hoje_str, {}).get('pagar', {})
-    print(f"Valores para F3:F7: {valores_pagar_hoje}")
-    
-    map_f3_f7 = {
-        "302": 3,
-        "429": 4,
-        "551": 5,
-        "601": 6,
-        "Nevine": 7
-    }
-    
-    for filial, linha in map_f3_f7.items():
-        val = valores_pagar_hoje.get(filial, 0)
-        celula = f"F{linha}"
-        await page.keyboard.press("F5")
-        await asyncio.sleep(1)
-        await page.keyboard.type(celula)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
-        if val > 0:
-            await page.keyboard.type(str(val).replace('.', ','))
-        else:
-            await page.keyboard.type("0")
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
-        print(f"    {filial} F{linha}: {val:.2f}")
-    
+    atualizacoes, dias_alvo = montar_atualizacoes_planilha(dt_nova, dados)
+    validar_mapa_atualizacoes(atualizacoes)
+    print(f"Preenchendo {len(atualizacoes)} células calculadas.")
+    await preencher_celulas(page, atualizacoes)
     print("Preenchimento concluído.")
     return True
+    
+
+def enviar_aviso_discord(url):
+    # Read webhook URL from environment, stripping any surrounding whitespace
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        print("Webhook do Discord não configurado.")
+        return
+    webhook_url = webhook_url.strip()
+    data = {"content": f"✅ A previsão de hoje foi gerada com sucesso!\nConfira na planilha: {url}"}
+    req = urllib.request.Request(
+        webhook_url,
+        data=json.dumps(data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/nevine, 1.0)"
+        },
+    )
+    try:
+        urllib.request.urlopen(req)
+        print("Notificação enviada ao Discord.")
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            print("Erro ao enviar notificação: webhook inválido ou sem permissões (403). Verifique a URL.")
+        else:
+            print(f"Erro ao enviar notificação para o Discord: {e}")
+    except Exception as e:
+        print(f"Erro ao enviar notificação para o Discord: {e}")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Automação de previsão financeira")
+    parser.add_argument("--dry-run", action="store_true", help="Calcula e imprime as células sem abrir ERP ou Google Sheets")
+    parser.add_argument("--data", help="Data base no formato YYYY-MM-DD; útil para dry-run e reprocessamentos controlados")
+    return parser.parse_args()
+
+def parse_data_base(data_str):
+    if not data_str:
+        return None
+    return datetime.strptime(data_str, "%Y-%m-%d")
 
 async def main():
+    args = parse_args()
     print("Iniciando Robô de Previsão...")
-    str_inicio, str_fim, _, d_inicio, d_fim = calcular_datas()
+    data_base = parse_data_base(args.data)
+    str_inicio, str_fim, _, d_inicio, d_fim = calcular_datas(data_base)
     
     print(f"Período de extração: {str_inicio} até {str_fim}")
+
+    if args.dry_run:
+        dados, _ = processar_csvs(d_inicio, d_fim)
+        data_previsao = data_base or datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        atualizacoes, dias_alvo = montar_atualizacoes_planilha(data_previsao, dados)
+        validar_mapa_atualizacoes(atualizacoes)
+        imprimir_dry_run(data_previsao, atualizacoes, dias_alvo)
+        return
     
     local_app_data = os.getenv("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
     user_data_dir = os.path.join(local_app_data, "Automacao_Previsao", "sessao_nova")
@@ -997,7 +906,9 @@ async def main():
         dados, valores_originais = processar_csvs(d_inicio, d_fim)
         
         # 3. Google Sheets
-        await atualizar_planilha(page, dados, valores_originais)
+        sucesso_planilha = await atualizar_planilha(page, dados, valores_originais, data_base=data_base)
+        if sucesso_planilha is not False:
+            enviar_aviso_discord(PLANILHA_URL)
         
         print("\nProcesso finalizado.")
         await context.close()
