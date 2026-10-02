@@ -2,7 +2,7 @@ import asyncio
 import os
 from playwright.async_api import async_playwright
 
-ERP_URL = "https://erp.admsis.com/Home?eng_tela=0107030100"
+ERP_URL = "https://erp.admsis.com/Home?eng_tela=0117030100"
 
 async def main():
     local_app_data = os.getenv("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
@@ -22,6 +22,7 @@ async def main():
 
         # Selecionar relatório 2004
         print("Selecionando relatório 2004...")
+        await page.wait_for_selector('select#relatorio', timeout=30000)
         await page.select_option('select#relatorio', '2004')
         await asyncio.sleep(4)  # Aguardar form carregar campos dinâmicos
         

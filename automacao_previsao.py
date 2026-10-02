@@ -282,7 +282,7 @@ async def baixar_relatorio(page, relatorio_id, str_inicio, str_fim, nome_arquivo
     print(f"\nBaixando relatório {relatorio_id}...")
     
     try:
-        await page.goto("https://erp.admsis.com/Home?eng_tela=0107030100", timeout=60000)
+        await page.goto("https://erp.admsis.com/Home?eng_tela=0117030100", timeout=60000)
     except:
         print("Erro ao acessar URL direta do relatório.")
         return False
@@ -292,6 +292,7 @@ async def baixar_relatorio(page, relatorio_id, str_inicio, str_fim, nome_arquivo
     
     # 1. Selecionar o relatório
     try:
+        await page.wait_for_selector('select#relatorio', timeout=30000)
         await page.select_option('select#relatorio', relatorio_id)
         await asyncio.sleep(2)
         await esperar_carregamento_erp(page)
@@ -651,20 +652,32 @@ async def atualizar_planilha(page, dados, valores_originais, data_base=None):
     if "accounts.google.com" in page.url:
         print("Login do Google detectado. Inserindo credenciais...")
         try:
-            # Tela de email: usar apenas o campo visível
+            # Tela "Confirme que é você" (confirmidentifier) — só clicar em Avançar
+            if "confirmidentifier" in page.url:
+                print("Tela 'Confirme que é você' detectada. Clicando em Avançar...")
+                try:
+                    avancar = page.locator('button:has-text("Avançar"), button:has-text("Next")').first
+                    await avancar.wait_for(state="visible", timeout=10000)
+                    await avancar.click()
+                    await asyncio.sleep(4)
+                    print("Avançar clicado. Aguardando tela de senha...")
+                except Exception as e_avancar:
+                    print(f"Erro ao clicar em Avançar: {e_avancar}")
+
+            # Tela de email: preencher se o campo estiver visível
             email_selector = '#identifierId'
             email_field = page.locator(email_selector).first
             try:
-                await email_field.wait_for(state="visible", timeout=10000)
+                await email_field.wait_for(state="visible", timeout=8000)
                 await email_field.fill(GOOGLE_USER)
                 await page.click('#identifierNext')
                 await asyncio.sleep(4)
                 print("Email inserido. Aguardando tela de senha...")
             except Exception as e_email:
-                print(f"Campo de email não visível (pode já estar na tela de senha): {e_email}")
+                print(f"Campo de email não visível (pulando): {e_email}")
 
             # Tela de senha
-            password_field = page.locator('input[name="Passwd"]').first
+            password_field = page.locator('input[name="Passwd"], input[type="password"]').first
             await password_field.wait_for(state="visible", timeout=20000)
             await password_field.fill(GOOGLE_PASS)
             await page.click('#passwordNext')
@@ -712,13 +725,13 @@ async def atualizar_planilha(page, dados, valores_originais, data_base=None):
     hoje = (data_base or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
     aba_hoje = hoje.strftime("%d %m %Y")
     
-    print(f"Procurando a aba mais recente antes de '{aba_hoje}' para duplicar.")
+    print(f"Procurando a aba de hoje '{aba_hoje}' ou a base anterior para duplicar.")
     
     # 3. Encontrar todas as abas
     tabs = await page.query_selector_all(".docs-sheet-tab-name")
     
     aba_origem_tab = None
-    aba_hoje_existe = False
+    aba_hoje_tab = None
     tab_names = []
     
     for tab in tabs:
@@ -727,7 +740,7 @@ async def atualizar_planilha(page, dados, valores_originais, data_base=None):
         print(f"  Aba encontrada: '{nome}'")
         tab_names.append((nome, tab))
         if nome == aba_hoje or nome.startswith(aba_hoje):
-            aba_hoje_existe = True
+            aba_hoje_tab = tab
     
     aba_origem, aba_origem_tab = selecionar_aba_origem(tab_names, hoje)
     if aba_origem_tab is None:
@@ -736,82 +749,56 @@ async def atualizar_planilha(page, dados, valores_originais, data_base=None):
     
     print(f"Aba origem encontrada: '{aba_origem}'")
     
-    # 4. Verificar se a aba de hoje já existe — se sim, excluir para recriar do zero
-    if aba_hoje_existe:
-        print(f"Aba '{aba_hoje}' já existe. Excluindo para recriar corretamente...")
-        for tab in tab_names:
-            nome, t = tab
-            if nome == aba_hoje or nome.startswith(aba_hoje):
-                await t.click()
-                await asyncio.sleep(1)
-                await clicar_opcao_menu_aba_ativa(page, ["Excluir", "Delete"])
-                await asyncio.sleep(1)
-                # Confirmar se aparecer um diálogo
-                try:
-                    ok_btn = page.locator('button:has-text("OK"), button:has-text("Excluir"), button:has-text("Delete")').first
-                    if await ok_btn.is_visible(timeout=3000):
-                        await ok_btn.click()
-                        await asyncio.sleep(1)
-                except:
-                    pass
-                print(f"Aba '{nome}' excluída.")
-                break
-        aba_hoje_existe = False  # forçar recriação abaixo
+    # 4. Se a aba de hoje já existe, preencher por cima. Se não existe, duplicar a base anterior.
+    if aba_hoje_tab is not None:
+        print(f"Aba '{aba_hoje}' já existe. Abrindo para sobrescrever os dados de hoje...")
+        await aba_hoje_tab.click()
         await asyncio.sleep(2)
-        tabs = await page.query_selector_all(".docs-sheet-tab-name")
-        tab_names = []
-        for tab in tabs:
-            nome = await tab.inner_text()
-            tab_names.append((nome.strip(), tab))
-        aba_origem, aba_origem_tab = selecionar_aba_origem(tab_names, hoje)
-        if aba_origem_tab is None:
-            print("Aba origem não encontrada após excluir a aba de hoje.")
-            return False
+        await mover_aba_ativa_para_inicio(page)
+    else:
+        # 6. Ativar a aba origem e duplicar
+        print(f"Ativando aba '{aba_origem}'...")
+        await aba_origem_tab.click()
+        await asyncio.sleep(2)
+        print(f"Duplicando aba '{aba_origem}'...")
+        await clicar_opcao_menu_aba_ativa(page, ["Duplicar", "Duplicate"])
+        print("Aba duplicada. Aguardando processamento do Google Sheets...")
+        await asyncio.sleep(8)
 
-    # 6. Ativar a aba origem e duplicar
-    print(f"Ativando aba '{aba_origem}'...")
-    await aba_origem_tab.click()
-    await asyncio.sleep(2)
-    print(f"Duplicando aba '{aba_origem}'...")
-    await clicar_opcao_menu_aba_ativa(page, ["Duplicar", "Duplicate"])
-    print("Aba duplicada. Aguardando processamento do Google Sheets...")
-    await asyncio.sleep(8)
-    
-    # Tentar fechar modal se existir (Forçando remoção via JS)
-    try:
-        await page.evaluate('''
-            document.querySelectorAll(".modal-dialog-bg, .modal-dialog").forEach(el => el.remove());
-        ''')
-        await asyncio.sleep(1)
-    except:
-        pass
-    
-    await asyncio.sleep(2)
-    
-    # 7. Renomear a aba duplicada para hoje
-    print(f"Renomeando aba para '{aba_hoje}'...")
-    # Ensure the tab name element is ready
-    await page.wait_for_selector('.docs-sheet-active-tab .docs-sheet-tab-name', state='visible', timeout=15000)
-    nova_aba_tab = page.locator('.docs-sheet-active-tab .docs-sheet-tab-name')
-    try:
-        await nova_aba_tab.dblclick()
-    except Exception:
-        # fallback: right-click then choose rename
-        await nova_aba_tab.click(button='right')
-        await asyncio.sleep(0.5)
-        renomear_opt = page.locator('.goog-menuitem:has-text("Renomear"), .goog-menuitem:has-text("Rename")').first
-        await renomear_opt.click()
-        await asyncio.sleep(0.5)
-    # Clear existing name and type new name. Google Sheets on macOS needs Meta+A.
-    await page.keyboard.press("Control+A")
-    await page.keyboard.press("Meta+A")
-    await page.keyboard.press("Backspace")
-    await page.keyboard.type(aba_hoje)
-    await page.keyboard.press("Enter")
-    await asyncio.sleep(3)
-    
-    print(f"Aba renomeada para '{aba_hoje}'.")
-    await mover_aba_ativa_para_inicio(page)
+        # Tentar fechar modal se existir (Forçando remoção via JS)
+        try:
+            await page.evaluate('''
+                document.querySelectorAll(".modal-dialog-bg, .modal-dialog").forEach(el => el.remove());
+            ''')
+            await asyncio.sleep(1)
+        except:
+            pass
+
+        await asyncio.sleep(2)
+
+        # 7. Renomear a aba duplicada para hoje
+        print(f"Renomeando aba para '{aba_hoje}'...")
+        await page.wait_for_selector('.docs-sheet-active-tab .docs-sheet-tab-name', state='visible', timeout=15000)
+        nova_aba_tab = page.locator('.docs-sheet-active-tab .docs-sheet-tab-name')
+        try:
+            await nova_aba_tab.dblclick()
+        except Exception:
+            # fallback: right-click then choose rename
+            await nova_aba_tab.click(button='right')
+            await asyncio.sleep(0.5)
+            renomear_opt = page.locator('.goog-menuitem:has-text("Renomear"), .goog-menuitem:has-text("Rename")').first
+            await renomear_opt.click()
+            await asyncio.sleep(0.5)
+        # Clear existing name and type new name. Google Sheets on macOS needs Meta+A.
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Meta+A")
+        await page.keyboard.press("Backspace")
+        await page.keyboard.type(aba_hoje)
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(3)
+
+        print(f"Aba renomeada para '{aba_hoje}'.")
+        await mover_aba_ativa_para_inicio(page)
     
     dt_nova = hoje
     
@@ -856,6 +843,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Automação de previsão financeira")
     parser.add_argument("--dry-run", action="store_true", help="Calcula e imprime as células sem abrir ERP ou Google Sheets")
     parser.add_argument("--data", help="Data base no formato YYYY-MM-DD; útil para dry-run e reprocessamentos controlados")
+    parser.add_argument("--skip-erp", action="store_true", help="Pula o download do ERP e usa os ZIPs já existentes para preencher a planilha")
     return parser.parse_args()
 
 def parse_data_base(data_str):
@@ -879,28 +867,36 @@ async def main():
         imprimir_dry_run(data_previsao, atualizacoes, dias_alvo)
         return
     
-    local_app_data = os.getenv("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
+    import platform
+    if platform.system() == "Darwin":
+        local_app_data = os.path.expanduser("~/Library/Application Support")
+    elif platform.system() == "Windows":
+        local_app_data = os.getenv("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
+    else:
+        local_app_data = os.path.expanduser("~/.local/share")
     user_data_dir = os.path.join(local_app_data, "Automacao_Previsao", "sessao_nova")
     os.makedirs(user_data_dir, exist_ok=True)
     
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir,
-            headless=False,
+            headless=True,
             viewport={"width": 1366, "height": 768},
-            args=["--start-maximized"]
         )
         page = context.pages[0] if context.pages else await context.new_page()
         page.on("dialog", lambda dialog: dialog.accept())
         
         # 1. ERP
-        sucesso = await login_erp(page)
-        if sucesso:
-            print("Baixando Títulos a Receber (2004)...")
-            await baixar_relatorio(page, "2004", str_inicio, str_fim, "titulos a receber.zip")
-            
-            print("Baixando Títulos a Pagar (2015)...")
-            await baixar_relatorio(page, "2015", str_inicio, str_fim, "titulos a pagar.zip")
+        if args.skip_erp:
+            print("--skip-erp ativo: pulando download do ERP e usando ZIPs existentes.")
+        else:
+            sucesso = await login_erp(page)
+            if sucesso:
+                print("Baixando Títulos a Receber (2004)...")
+                await baixar_relatorio(page, "2004", str_inicio, str_fim, "titulos a receber.zip")
+                
+                print("Baixando Títulos a Pagar (2015)...")
+                await baixar_relatorio(page, "2015", str_inicio, str_fim, "titulos a pagar.zip")
             
         # 2. Pandas
         dados, valores_originais = processar_csvs(d_inicio, d_fim)

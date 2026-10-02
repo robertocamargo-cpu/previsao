@@ -55,8 +55,10 @@ O arquivo deve conter feriados nacionais, estaduais de São Paulo e municipais d
 - `YYYY-MM-DD - Nome do feriado` para feriados específicos
 
 ### Abas da Planilha
-- A nova aba é criada a partir da aba com data mais recente anterior ao dia atual.
-- Depois de criada e renomeada, a nova aba é movida para a primeira posição da planilha.
+- Se a aba do dia atual já existir, a automação deve abrir essa aba e sobrescrever os dados calculados.
+- Se a aba do dia atual ainda não existir, a automação cria uma nova aba a partir da aba com data mais recente anterior ao dia atual.
+- Depois de criada ou aberta, a aba do dia deve ficar na primeira posição da planilha.
+- Não excluir a aba de hoje para recriar, porque o menu do Google Sheets pode falhar e isso aumenta o risco operacional.
 
 ## Arquivos
 - `automacao_previsao.py` - Script principal
@@ -140,15 +142,20 @@ Campos principais:
 
 ## Fluxo
 1. Login no ERP (se necessário)
-2. Download dos relatórios 2004 (receber) e 2015 (pagar)
+2. Download dos relatórios 2004 (receber) e 2015 (pagar) na tela ERP `0117030100`
 3. Processamento dos CSVs
 4. Preenchimento da planilha Google Sheets
 
 ## Troubleshooting
 
+### Relatórios não carregam no ERP
+- A tela correta dos relatórios financeiros é `0117030100`.
+- A tela antiga `0107030100` pode retornar `Tela não encontrada` e fazer o `select#relatorio` dar timeout.
+- Antes de selecionar 2004 ou 2015, aguardar `select#relatorio` ficar disponível.
+
 ### Valores não aparecem na planilha
 - Verificar se o navegador está em primeiro plano
-- Verificar logs de execução para ver os valores being preenchidos
+- Verificar logs de execução para ver os valores sendo preenchidos
 
 ### Valores incorretos
 - Verificar se o ajuste de data está correto
